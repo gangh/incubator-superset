@@ -1039,12 +1039,8 @@ class Superset(BaseSupersetView):
             slc = db.session.query(models.Slice).filter_by(id=slice_id).first()
 
         error_redirect = '/slicemodelview/list/'
-        datasource = (
-            db.session.query(ConnectorRegistry.sources[datasource_type])
-            .filter_by(id=datasource_id)
-            .one()
-        )
-
+        datasource = ConnectorRegistry.get_datasource(
+            datasource_type, datasource_id, db.session)
         if not datasource:
             flash(DATASOURCE_MISSING_ERR, "danger")
             return redirect(error_redirect)
@@ -1091,6 +1087,7 @@ class Superset(BaseSupersetView):
             "standalone": standalone,
             "user_id": user_id,
             "forced_height": request.args.get('height'),
+            'common': self.common_bootsrap_payload(),
         }
         table_name = datasource.table_name \
             if datasource_type == 'table' \
@@ -1119,13 +1116,8 @@ class Superset(BaseSupersetView):
         :return:
         """
         # TODO: Cache endpoint by user, datasource and column
-        datasource_class = ConnectorRegistry.sources[datasource_type]
-        datasource = (
-            db.session.query(datasource_class)
-            .filter_by(id=datasource_id)
-            .first()
-        )
-
+        datasource = ConnectorRegistry.get_datasource(
+            datasource_type, datasource_id, db.session)
         if not datasource:
             return json_error_response(DATASOURCE_MISSING_ERR)
         if not self.datasource_access(datasource):
@@ -1303,13 +1295,28 @@ class Superset(BaseSupersetView):
         session = db.session()
         data = json.loads(request.form.get('data'))
         dash = models.Dashboard()
-        original_dash = (session
-                         .query(models.Dashboard)
-                         .filter_by(id=dashboard_id).first())
+        original_dash = (
+            session
+            .query(models.Dashboard)
+            .filter_by(id=dashboard_id).first())
 
         dash.owners = [g.user] if g.user else []
         dash.dashboard_title = data['dashboard_title']
-        dash.slices = original_dash.slices
+        if data['duplicate_slices']:
+            # Duplicating slices as well, mapping old ids to new ones
+            old_to_new_sliceids = {}
+            for slc in original_dash.slices:
+                new_slice = slc.clone()
+                new_slice.owners = [g.user] if g.user else []
+                session.add(new_slice)
+                session.flush()
+                new_slice.dashboards.append(dash)
+                old_to_new_sliceids['{}'.format(slc.id)] =\
+                    '{}'.format(new_slice.id)
+            for d in data['positions']:
+                d['slice_id'] = old_to_new_sliceids[d['slice_id']]
+        else:
+            dash.slices = original_dash.slices
         dash.params = original_dash.params
 
         self._set_dash_metadata(dash, data)
@@ -1728,6 +1735,7 @@ class Superset(BaseSupersetView):
             'user_id': g.user.get_id(),
             'dashboard_data': dashboard_data,
             'datasources': {ds.uid: ds.data for ds in datasources},
+            'common': self.common_bootsrap_payload(),
         }
 
         return self.render_template(
@@ -2000,7 +2008,7 @@ class Superset(BaseSupersetView):
         schema = request.form.get('schema') or None
 
         session = db.session()
-        mydb = session.query(models.Database).filter_by(id=database_id).one()
+        mydb = session.query(models.Database).filter_by(id=database_id).first()
 
         if not mydb:
             json_error_response(
@@ -2081,13 +2089,12 @@ class Superset(BaseSupersetView):
                 # pylint: disable=no-value-for-parameter
                 data = sql_lab.get_sql_results(
                     query_id=query_id, return_results=True)
-                payload = json.dumps(data, default=utils.json_iso_dttm_ser)
         except Exception as e:
             logging.exception(e)
             return json_error_response("{}".format(e))
         if data.get('status') == QueryStatus.FAILED:
-            return json_error_response(payload)
-        return json_success(payload)
+            return json_error_response(payload=data)
+        return json_success(json.dumps(data, default=utils.json_iso_dttm_ser))
 
     @has_access
     @expose("/csv/<client_id>")
@@ -2138,13 +2145,8 @@ class Superset(BaseSupersetView):
     def fetch_datasource_metadata(self):
         datasource_id, datasource_type = (
             request.args.get('datasourceKey').split('__'))
-        datasource_class = ConnectorRegistry.sources[datasource_type]
-        datasource = (
-            db.session.query(datasource_class)
-            .filter_by(id=int(datasource_id))
-            .first()
-        )
-
+        datasource = ConnectorRegistry.get_datasource(
+            datasource_type, datasource_id, db.session)
         # Check if datasource exists
         if not datasource:
             return json_error_response(DATASOURCE_MISSING_ERR)
@@ -2282,7 +2284,8 @@ class Superset(BaseSupersetView):
                 'email': user.email,
                 'roles': roles,
                 'permissions': permissions,
-            }
+            },
+            'common': self.common_bootsrap_payload(),
         }
         return self.render_template(
             'superset/basic.html',
@@ -2298,6 +2301,7 @@ class Superset(BaseSupersetView):
         """SQL Editor"""
         d = {
             'defaultDbId': config.get('SQLLAB_DEFAULT_DBID'),
+            'common': self.common_bootsrap_payload(),
         }
         return self.render_template(
             'superset/basic.html',
